@@ -1,0 +1,23 @@
+[project]
+name = "pycertifspec"
+version = "0.1.0"
+description = "Python client for SPEC instrument control software"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+bluesky = ["ophyd"]
+dev = ["pytest"]
+
+[project.scripts]
+pycertifspec = "pycertifspec.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

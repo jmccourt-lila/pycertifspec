@@ -1,10 +1,11 @@
 import collections
+import collections.abc
 from .Var import Var
 from .DataTypes import DataTypes
 
 from typing import Tuple
 
-class ArrayVar(Var, collections.MutableSequence):
+class ArrayVar(Var, collections.abc.MutableSequence):
     """
     Represents a SPEC array and behaves like a regular python list. Values assigned to array indices will be pushed to SPEC.
 
@@ -78,7 +79,7 @@ class ArrayVar(Var, collections.MutableSequence):
         return 'ArrayVar("{}", client)'.format(self.name)
 
 
-class SubArrayVar(collections.MutableSequence):
+class SubArrayVar(collections.abc.MutableSequence):
     """
     Represents a row in a 2-dimensional SPEC array. 
     All data and modifications are still synced with SPEC.
@@ -87,7 +88,7 @@ class SubArrayVar(collections.MutableSequence):
         if not isinstance(parent, ArrayVar):
             raise ValueError("parent should be instance of ArrayVar")
         if index >= len(parent):
-            raise IndexError("Index {} is out of bounds for axis 0 of array")
+            raise IndexError(f"Index {index} is out of bounds for axis 0 of array")
 
         self.parent = parent
         self.index = index

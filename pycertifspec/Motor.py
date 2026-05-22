@@ -71,20 +71,21 @@ class Motor(object):
     """backlash"""
 
     _observed_properties = ["position", "dial_position", "move_done"]
-    _observed_properties_conditions = {}
-    _observed_properties_cbs = []
 
     def __init__(self, mne, conn):
         self.name = mne
         """The string mnemonic of the motor"""
         self.conn = conn
 
+        self._observed_properties_conditions = {}
+        self._observed_properties_cbs = []
+
         # Some properties listen to change events instead of polling from the server all the time
         for prop in self._observed_properties:
-            def set_and_notify(res):
-                setattr(self, "_"+prop, res.body)
-                with self._observed_properties_conditions[prop]:
-                    self._observed_properties_conditions[prop].notify_all()
+            def set_and_notify(res, _prop=prop):
+                setattr(self, "_" + _prop, res.body)
+                with self._observed_properties_conditions[_prop]:
+                    self._observed_properties_conditions[_prop].notify_all()
 
             self._observed_properties_cbs.append(set_and_notify)
             self._observed_properties_conditions[prop] = threading.Condition()

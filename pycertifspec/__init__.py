@@ -8,3 +8,5 @@ from .Var import Var
 from .ArrayVar import ArrayVar
 from .SpecSocket import SpecSocket
 from .SpecError import SpecError
+from .Scan import Scan
+from .AsyncClient import AsyncClient, AsyncScan

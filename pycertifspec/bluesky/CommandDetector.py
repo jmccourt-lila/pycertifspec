@@ -49,19 +49,19 @@ class CommandDetector:
         self.description = ""
         self._description_time = 0
 
-        self._data = OrderedDict(
+        self._data = OrderedDict([
             ('start_response', {'value': ('', ''), 'timestamp': 0}),
             ('poll_responses', {'value': [], 'timestamp': 0})
-        )
+        ])
 
     def read(self):
         return self._data
     
     def describe(self):
-        return OrderedDict(
+        return OrderedDict([
             ('start_response', {'source': 'SPEC', 'dtype': 'tuple', 'shape': [2]}),
             ('poll_responses', {'source': 'SPEC', 'dtype': 'list', 'shape': []})
-        )
+        ])
 
     def trigger(self):
         self._status = Status()
@@ -86,7 +86,7 @@ class CommandDetector:
         return self._status
 
     def read_configuration(self):
-        return OrderedDict(('description', {'value': self.description, 'timestamp': self._description_time}))
+        return OrderedDict([('description', {'value': self.description, 'timestamp': self._description_time})])
 
     def describe_configuration(self):
         return OrderedDict(('description', {'source': 'user-defined', 'dtype': 'string', 'shape': []}))
