@@ -12,16 +12,26 @@ from .Var import Var
 from .ArrayVar import ArrayVar
 from .SpecSocket import SpecSocket, SpecMessage
 from .SpecError import SpecError
+from .Scan import Scan
 from typing import Callable, List, Tuple, Any, Type, Dict, Union
-import traceback
 
 class Client:
     """
-    Connection to SPEC 
-    
+    Connection to SPEC
+
     You should only need one instance of this class and use it to create Motor, Variable, etc. instances
     """
-    def __init__(self, host:str="localhost", port:int=None, port_range:Tuple[int, int]=(6510, 6530), ports:List[int]=[], timeout:float=0.5, log_messages:bool=False):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = None,
+        port_range: Tuple[int, int] = (6510, 6530),
+        ports: List[int] = [],
+        timeout: float = 0.5,
+        log_messages: bool = False,
+        auto_reconnect: bool = True,
+        reconnect_delay: float = 2.0,
+    ):
         """
         Attempt to create a connection to SPEC
 
@@ -32,13 +42,24 @@ class Client:
             ports (list[int]): List of ports to scan
             timeout (float): Time to wait for answer before trying the next port
             log_messages (boolean): Print all incoming SpecMessages
+            auto_reconnect (boolean): Automatically reconnect when the connection drops
+            reconnect_delay (float): Seconds to wait between reconnect attempts
         """
         self.log_messages = log_messages
+        self._auto_reconnect = auto_reconnect
+        self._reconnect_delay = reconnect_delay
 
+        # Save connection params for reconnect
+        self._host = host
+        self._port = port
+        self._port_range = port_range
+        self._ports = ports
+        self._scan_timeout = timeout
+
+        self._connected = False
         self.sock = SpecSocket()
         self.sock.connect_spec(host, port, port_range, ports, timeout)
-
-        threading.Thread(target=self._listener_thread, daemon=True).start()
+        self._connected = True
 
         self._sn_counter = 0
         self._sn_callbacks = {}
@@ -56,10 +77,13 @@ class Client:
         self._last_console_print = ""
         self._console_print_lines = []
 
+        # Thread must be running before any send/recv calls below
+        threading.Thread(target=self._listener_thread, daemon=True).start()
+
         self.counter_names = collections.OrderedDict()
         self._get_counter_names()
 
-        self.subscribe("error", None, nowait=True)
+        self.subscribe("error", lambda _: None, nowait=True)
         self.subscribe("output/tty", self._console_listener)
 
     def _console_listener(self, msg):
@@ -71,7 +95,24 @@ class Client:
 
     def _listener_thread(self):
         while True:
-            msg = self.sock.recv_spec()
+            try:
+                msg = self.sock.recv_spec()
+            except (OSError, ConnectionResetError, ValueError):
+                self._connected = False
+                # Unblock any callers waiting for a reply so they get None
+                with self._send_lock:
+                    for event in self._reply_events.values():
+                        event.set()
+                if self._auto_reconnect:
+                    tm.sleep(self._reconnect_delay)
+                    try:
+                        self._do_reconnect()
+                    except Exception:
+                        pass  # will retry on next loop iteration
+                else:
+                    return
+                continue
+
             if self.log_messages:
                 print("MSG LOG:", msg)
             if msg.cmd == EventTypes.SV_EVENT:
@@ -87,7 +128,33 @@ class Client:
                 self._reply_msgs[msg.sn] = msg
                 self._reply_events[msg.sn].set()
 
-    def _send(self, command:str, data_type:int=0, property_name:str="", body:bytes=b'', error:bool=False, flags:List[int]=[], rows:int=0, cols:int=0, wait_for_response:float=0, callback:Callable[[SpecMessage], None]=None) -> None:
+    def _do_reconnect(self):
+        """Create a new socket connection and re-register all active subscriptions."""
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+        self.sock = SpecSocket()
+        self.sock.connect_spec(
+            self._host, self._port, self._port_range, self._ports, self._scan_timeout
+        )
+        self._connected = True
+
+        with self._subscribe_lock:
+            for prop in list(self._subscribers.keys()):
+                self.sock.send_spec(0, EventTypes.SV_REGISTER, 0, prop)
+
+    def reconnect(self):
+        """
+        Manually trigger reconnection to SPEC.
+
+        Useful when auto_reconnect=False or to force an immediate reconnect.
+        Raises an exception if no SPEC server is found.
+        """
+        self._do_reconnect()
+
+    def _send(self, command: str, data_type: int = 0, property_name: str = "", body: bytes = b'', error: bool = False, flags: List[int] = [], rows: int = 0, cols: int = 0, wait_for_response: float = 0, callback: Callable[[SpecMessage], None] = None) -> None:
         """
         Send a message to SPEC
 
@@ -97,7 +164,8 @@ class Client:
         Returns:
             (SpecMessage): Reply from SPEC if it occurred within wait_for_response seconds
         """
-        #print(traceback.print_stack())
+        if not self._connected:
+            raise SpecError("not connected")
         with self._send_lock:
             self._sn_counter = self._sn_counter + 1
             if callback is not None:
@@ -107,15 +175,15 @@ class Client:
             self.sock.send_spec(self._sn_counter, command, data_type, property_name, body, error, flags, rows, cols)
             if wait_for_response != 0:
                 if self._reply_events[self._sn_counter].wait(wait_for_response):
-                    msg = self._reply_msgs[self._sn_counter]
-                    del self._reply_msgs[self._sn_counter]
+                    msg = self._reply_msgs.get(self._sn_counter)
+                    self._reply_msgs.pop(self._sn_counter, None)
                     del self._reply_events[self._sn_counter]
                     return msg
                 else:
                     del self._reply_events[self._sn_counter]
 
 
-    def subscribe(self, prop:str, callback:Callable[[SpecMessage], None], nowait:bool=False, timeout:float=0.2) -> bool:
+    def subscribe(self, prop: str, callback: Callable[[SpecMessage], None], nowait: bool = False, timeout: float = 0.2) -> bool:
         """
         Subscribe to changes in a property.
 
@@ -123,7 +191,7 @@ class Client:
             prop (string): The name of the property
             callback (function): The function to be called when the event is received. Will also be called immediately after subscribing
             nowait (boolean): By default the function waits for the first event after registering to see if an error occurred. To skip that set True
-            timeout (float): The timeout to wait for a response after subscribing. Function returns False when it runs out 
+            timeout (float): The timeout to wait for a response after subscribing. Function returns False when it runs out
 
         Returns:
             True if successful, False when timeout reached
@@ -138,7 +206,7 @@ class Client:
                     def last_msg_cb(msg):
                         last_msg["msg"] = msg
                         last_msg["event"].set()
-                    
+
                     self._subscribers[prop] = [last_msg_cb]
                     self._subscribers["error"].append(last_msg_cb)
 
@@ -163,7 +231,7 @@ class Client:
 
             return True
 
-    def unsubscribe(self, prop:str, callback:Callable[[SpecMessage], None]) -> bool:
+    def unsubscribe(self, prop: str, callback: Callable[[SpecMessage], None]) -> bool:
         """
         Unsubscribe from changes in the property.
 
@@ -175,7 +243,7 @@ class Client:
             (boolean): True if the callback was removed, False if it didn't exist anyways
         """
         with self._subscribe_lock:
-            if prop in self._subscribers.keys() and callback in self._subscribers[prop]: 
+            if prop in self._subscribers.keys() and callback in self._subscribers[prop]:
                 self._subscribers[prop].remove(callback)
 
                 # Unsubscribe if nothing is listening anymore
@@ -185,7 +253,7 @@ class Client:
                 return True
             return False
 
-    def run(self, console_command:str, blocking:bool=True, callback:Callable[[SpecMessage, str], None]=None) -> Tuple[SpecMessage, str]:
+    def run(self, console_command: str, blocking: bool = True, callback: Callable[[SpecMessage, str], None] = None) -> Tuple[SpecMessage, str]:
         """
         Execute a command like from the interactive SPEC console
 
@@ -193,14 +261,14 @@ class Client:
             console_command (string): The command to execute
             blocking (boolean): When True, the function will block until it receives a response from SPEC and return the response
             callback (function): When blocking=False, the response will instead be send to the callback function. Expected to accept 2 positional arguments: data, console_output
-        
+
         Returns:
             Tuple[SpecMessage, str]: If blocking, the response message from the server and what would be printed to console
         """
         event = EventTypes.SV_FUNC_WITH_RETURN if blocking or callback is not None else EventTypes.SV_FUNC
         if console_command[-1] != '\n':
             console_command += '\n'
-        
+
         if blocking or callback:
             res = {"event": threading.Event(), "val": None}
             def res_cb(msg):
@@ -209,7 +277,7 @@ class Client:
                 if blocking:
                     res["val"] = msg
                     res["event"].set()
-            
+
             self._send(event, body=console_command.encode("ascii"), callback=res_cb)
 
             if blocking:
@@ -218,7 +286,7 @@ class Client:
         else:
             self._send(event, property_name=console_command)
 
-    def set(self, prop:str, value:Any, wait_for_error:float=0.2):
+    def set(self, prop: str, value: Any, wait_for_error: float = 0.2):
         """
         Set a property.
 
@@ -233,7 +301,7 @@ class Client:
         if prop in self._watch_values.keys():
             self._watch_values[prop]["body"] = value.encode("ascii")
 
-    def get(self, prop:str, force_fetch:bool=False) -> SpecMessage:
+    def get(self, prop: str, force_fetch: bool = False) -> SpecMessage:
         """
         Get a property.
 
@@ -248,7 +316,7 @@ class Client:
             return self._watch_values[prop]
         return self._send(EventTypes.SV_CHAN_READ, DataTypes.SV_STRING, property_name=prop, wait_for_response=0.5)
 
-    def watch(self, prop:str) -> bool:
+    def watch(self, prop: str) -> bool:
         """
         Listen for changes in prop to speed up .get() method
 
@@ -263,7 +331,7 @@ class Client:
         self._watchers[prop] = watcher
         return self.subscribe(prop, watcher)
 
-    def unwatch(self, prop:str):
+    def unwatch(self, prop: str):
         """
         Stop listening for changes in prop
 
@@ -274,7 +342,7 @@ class Client:
         del self._watchers[prop]
         del self._watch_values[prop]
 
-    def motor(self, mne:str) -> Motor:
+    def motor(self, mne: str) -> Motor:
         """
         Get the motor as an object
 
@@ -286,7 +354,7 @@ class Client:
         """
         return Motor(mne, self)
 
-    def var(self, name:str, dtype:Type=str) -> Union[Var, ArrayVar]:
+    def var(self, name: str, dtype: Type = str) -> Union[Var, ArrayVar]:
         """
         Get the variable as an object
 
@@ -301,7 +369,7 @@ class Client:
         if val and val.type in DataTypes.ARRAYS:
             return ArrayVar(name, self)
         return Var(name, self, dtype=dtype)
-    
+
     def abort(self):
         """
         Abort all running commands
@@ -342,10 +410,10 @@ class Client:
         """
         self.counter_names = collections.OrderedDict()
         for i in range(self.var("COUNTERS", dtype=int).value):
-            self.counter_names[self.run("cnt_mne({})".format(i))[0].body] = self.run("cnt_name({})".format(i))[0].body 
-        return self.counter_names      
+            self.counter_names[self.run("cnt_mne({})".format(i))[0].body] = self.run("cnt_name({})".format(i))[0].body
+        return self.counter_names
 
-    def count(self, time:float, callback:Callable=None, refresh_names:bool=False) -> Dict[str, float]:
+    def count(self, time: float, callback: Callable = None, refresh_names: bool = False) -> Dict[str, float]:
         """
         Counts scalers for the time specified. This function is blocking. The callback function will receive occasional updates during counting and when counting is finished.
 
@@ -365,7 +433,7 @@ class Client:
             countvals[res.name.split("/")[1]] = float(res.body)
             if callback:
                 threading.Thread(target=callback, args=(countvals,)).start()
-        
+
         for counter in self.counter_names.keys():
             self.subscribe("scaler/{}/value".format(counter), count_callback)
 
@@ -381,4 +449,16 @@ class Client:
         """
         Stop counting immediately. Will also cause .count() call to return if started in different thread.
         """
-        self.set("scaler/.all./count", 0)
+        self.set("scaler/.all./count", "0")
+
+    def scan(self, command: str) -> Scan:
+        """
+        Create a Scan object for a SPEC scan macro command.
+
+        Parameters:
+            command (string): Full SPEC scan command, e.g. ``"ascan m0 0 10 20 0.5"``
+
+        Returns:
+            (Scan): Call .run() to execute blocking, .run_iter() to stream points.
+        """
+        return Scan(self, command)
